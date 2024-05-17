@@ -1,31 +1,18 @@
-import neat
-import gym
+import neat, gym, pickle, os
 import tensorflow_federated as tff
 import tensorflow as tf
 import numpy as np
-import pickle
-import os
+import matplotlib.pyplot as plt
 
 # Define a custom Keras layer for NEAT network
 class NEATLayer(tf.keras.layers.Layer):
     def __init__(self, neat_network, **kwargs):
         super(NEATLayer, self).__init__(**kwargs)
         self.neat_network = neat_network
-        self.neat_output = None
-
-    def build(self, input_shape):
-        self.neat_output = [self.add_weight(shape=(1,),
-                                            initializer=tf.constant_initializer(0),
-                                            trainable=False)
-                            for _ in range(self.neat_network.num_outputs)]
 
     def call(self, inputs):
-        batch_size = tf.shape(inputs)[0]
-        outputs = []
-        for i in range(batch_size):
-            output = self.neat_network.activate(inputs[i].numpy().tolist())
-            outputs.append(output)
-        return tf.convert_to_tensor(outputs)
+        outputs = tf.vectorized_map(lambda x: tf.convert_to_tensor(self.neat_network.activate(x.numpy().tolist())), inputs)
+        return outputs
 
 # Helper function to create environments and networks
 def create_environment_and_network(client_id, variation, config):
@@ -35,49 +22,8 @@ def create_environment_and_network(client_id, variation, config):
     network = neat.nn.FeedForwardNetwork.create(genome, config)
     return env, network
 
-# Load or create NEAT configuration
+# Load NEAT configuration
 config_path = './neat_config.txt'
-if not os.path.exists(config_path):
-    with open(config_path, 'w') as f:
-        f.write("""
-[NEAT]
-fitness_criterion     = max
-fitness_threshold     = 300
-pop_size              = 150
-reset_on_extinction   = False
-
-[DefaultGenome]
-num_hidden            = 0
-num_inputs            = 24
-num_outputs           = 4
-initial_connection    = full
-
-activation_default    = tanh
-activation_mutate_rate= 0.1
-activation_options    = tanh relu sigmoid
-
-node_add_prob         = 0.2
-node_delete_prob      = 0.1
-conn_add_prob         = 0.3
-conn_delete_prob      = 0.2
-conn_enable_rate      = 0.25
-conn_disable_rate     = 0.25
-
-[DefaultReproduction]
-elitism               = 2
-survival_threshold    = 0.2
-
-[DefaultSpeciesSet]
-compatibility_threshold = 3.0
-
-[DefaultStagnation]
-species_fitness_func  = max
-max_stagnation        = 20
-species_elitism       = 2
-
-[SteadyState]
-replacement_rate      = 0.2
-        """)
 config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
                      neat.DefaultSpeciesSet, neat.DefaultStagnation,
                      config_path)
@@ -136,20 +82,8 @@ def collect_client_data(environment, net, episodes=10):
             state = next_state
     # Convert to TFF dataset format
     states, actions, rewards, next_states, dones = zip(*data)
-    return tf.data.Dataset.from_tensor_slices((np.array(states), np.array(actions)))
-
-# Initialize environments and networks for clients
-clients = [create_environment_and_network(i, 1.0 + 0.1 * i, config) for i in range(5)]
-
-# Federated Learning Trainer Setup
-trainer = tff.learning.build_federated_averaging_process(model_fn)
-state = trainer.initialize()
-
-for round_num in range(10):
-    # Collect data for each client
-    client_data = [collect_client_data(client[0], client[1]) for client in clients]
-    state, metrics = trainer.next(state, client_data)
-    print(f'Round {round_num} metrics:', metrics)
+    dataset = tf.data.Dataset.from_tensor_slices((np.array(states), np.array(actions)))
+    return dataset.batch(32)  # Batch the dataset for federated learning
 
 # Implementing RLfD (create or load demonstrations)
 demo_file = 'demonstrations.pkl'
@@ -196,9 +130,92 @@ winner = population.run(lambda genomes, config: evaluate_with_demos(genomes, con
 with open(best_genome_path, 'wb') as f:
     pickle.dump(winner, f)
 
-# Rerun federated learning with new best genome after RLfD
+# Testing and Benchmarking Class
+class FederatedLearningTest:
+    def __init__(self, clients, model_fn, trainer, state, config, demonstrations):
+        self.clients = clients
+        self.model_fn = model_fn
+        self.trainer = trainer
+        self.state = state
+        self.config = config
+        self.demonstrations = demonstrations
+
+    def run_federated_training(self, rounds=10):
+        metrics_list = []
+        for round_num in range(rounds):
+            client_data = [collect_client_data(client[0], client[1]) for client in self.clients]
+            self.state, metrics = self.trainer.next(self.state, client_data)
+            metrics_list.append(metrics)
+            print(f'Round {round_num} metrics:', metrics)
+        return metrics_list
+
+    def evaluate_model(self, env, network, episodes=10):
+        total_reward = 0
+        for _ in range(episodes):
+            state = env.reset()
+            done = False
+            while not done:
+                action = np.clip(network.activate(state), -1, 1)
+                state, reward, done, _ = env.step(action)
+                total_reward += reward
+        return total_reward / episodes
+
+    def plot_metrics(self, metrics_list):
+        rounds = range(len(metrics_list))
+        mse = [metrics['mean_squared_error'].numpy() for metrics in metrics_list]
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(rounds, mse, label='Mean Squared Error')
+        plt.xlabel('Rounds')
+        plt.ylabel('Mean Squared Error')
+        plt.title('Federated Learning Training Metrics')
+        plt.legend()
+        plt.show()
+
+    def plot_rewards(self, rewards):
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(rewards)), rewards, label='Rewards')
+        plt.xlabel('Episodes')
+        plt.ylabel('Rewards')
+        plt.title('Model Rewards Over Episodes')
+        plt.legend()
+        plt.show()
+
+    def benchmark(self, baseline_reward):
+        neat_network = neat.nn.FeedForwardNetwork.create(pickle.load(open(best_genome_path, 'rb')), self.config)
+        client_rewards = [self.evaluate_model(client[0], neat_network) for client in self.clients]
+        avg_reward = np.mean(client_rewards)
+
+        print(f'Average reward after federated learning: {avg_reward}')
+        print(f'Baseline reward: {baseline_reward}')
+        
+        plt.figure(figsize=(10, 5))
+        plt.bar(['Baseline', 'Federated Learning'], [baseline_reward, avg_reward])
+        plt.ylabel('Average Reward')
+        plt.title('Benchmarking')
+        plt.show()
+
+# Initialize environments and networks for clients
+clients = [create_environment_and_network(i, 1.0 + 0.1 * i, config) for i in range(5)]
+
+# Federated Learning Trainer Setup
+trainer = tff.learning.build_federated_averaging_process(model_fn)
 state = trainer.initialize()
-for round_num in range(10):
-    client_data = [collect_client_data(client[0], neat.nn.FeedForwardNetwork.create(winner, config)) for client in clients]
-    state, metrics = trainer.next(state, client_data)
-    print(f'Round {round_num} metrics:', metrics)
+
+# Testing and benchmarking
+test = FederatedLearningTest(clients, model_fn, trainer, state, config, demonstrations)
+
+# Run federated training
+metrics = test.run_federated_training(rounds=10)
+
+# Plot training metrics
+test.plot_metrics(metrics)
+
+# Evaluate and plot rewards
+neat_network = neat.nn.FeedForwardNetwork.create(pickle.load(open(best_genome_path, 'rb')), config)
+rewards = [test.evaluate_model(client[0], neat_network) for client in clients]
+test.plot_rewards(rewards)
+
+# Benchmark the model
+baseline_reward = 100  # Replace with actual baseline reward for comparison
+test.benchmark(baseline_reward)
