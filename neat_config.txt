@@ -1,0 +1,40 @@
+[NEAT]
+fitness_criterion     = max
+fitness_threshold     = 300
+pop_size              = 150
+reset_on_extinction   = False
+
+[DefaultGenome]
+# Node genes
+num_hidden            = 0
+num_inputs            = 24  # This should match the number of inputs from the environment
+num_outputs           = 4   # This should match the action space of the environment
+initial_connection    = full
+
+# Network parameters
+activation_default    = tanh
+activation_mutate_rate= 0.1
+activation_options    = tanh relu sigmoid
+
+# Genome parameters
+node_add_prob         = 0.2
+node_delete_prob      = 0.1
+conn_add_prob         = 0.3
+conn_delete_prob      = 0.2
+conn_enable_rate      = 0.25
+conn_disable_rate     = 0.25
+
+[DefaultReproduction]
+elitism               = 2
+survival_threshold    = 0.2
+
+[DefaultSpeciesSet]
+compatibility_threshold = 3.0
+
+[DefaultStagnation]
+species_fitness_func  = max
+max_stagnation        = 20
+species_elitism       = 2
+
+[SteadyState]
+replacement_rate      = 0.2
