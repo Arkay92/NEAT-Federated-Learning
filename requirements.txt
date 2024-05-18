@@ -1,6 +1,11 @@
 gym
 neat-python
-tensorflow
-tensorflow-federated
 numpy
 pickle-mixin
+matplotlib
+seaborn
+tensorflow~=2.9.3
+tensorflow-addons
+tensorflow-federated
+jax
+jaxlib
