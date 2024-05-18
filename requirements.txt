@@ -4,8 +4,5 @@ numpy
 pickle-mixin
 matplotlib
 seaborn
-tensorflow~=2.9.3
-tensorflow-addons
+tensorflow
 tensorflow-federated
-jax
-jaxlib
