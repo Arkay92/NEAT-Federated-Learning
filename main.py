@@ -1,6 +1,6 @@
 import neat, gym, pickle, os
-import tensorflow_federated as tff
 import tensorflow as tf
+import tensorflow_federated as tff
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -18,15 +18,24 @@ class NEATLayer(tf.keras.layers.Layer):
 def create_environment_and_network(client_id, variation, config):
     env = gym.make('BipedalWalker-v3')
     env.env.gravity = variation * client_id
-    genome = pickle.load(open('best_genome.pkl', 'rb'))
+    try:
+        genome = pickle.load(open('best_genome.pkl', 'rb'))
+    except FileNotFoundError:
+        print("Error: 'best_genome.pkl' not found. Ensure the file exists and the path is correct.")
+        raise
     network = neat.nn.FeedForwardNetwork.create(genome, config)
     return env, network
 
 # Load NEAT configuration
 config_path = './neat_config.txt'
-config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
-                     neat.DefaultSpeciesSet, neat.DefaultStagnation,
-                     config_path)
+try:
+    config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
+                         neat.DefaultSpeciesSet, neat.DefaultStagnation,
+                         config_path)
+except FileNotFoundError:
+    print(f"Error: Configuration file '{config_path}' not found.")
+    raise
+
 population = neat.Population(config)
 
 # Evaluate genomes function with RLfD (assuming demonstrations are used)
@@ -56,15 +65,18 @@ if not os.path.exists(best_genome_path):
 
 # Define TensorFlow Federated model function using the NEAT genome
 def model_fn():
-    # Load and convert the best genome to a NEAT network
-    genome = pickle.load(open(best_genome_path, 'rb'))
+    try:
+        genome = pickle.load(open(best_genome_path, 'rb'))
+    except FileNotFoundError:
+        print(f"Error: Best genome file '{best_genome_path}' not found.")
+        raise
     neat_network = neat.nn.FeedForwardNetwork.create(genome, config)
     model = tf.keras.Sequential([
         NEATLayer(neat_network),
         tf.keras.layers.Dense(units=4, activation='tanh')  # Assuming this fits the action space
     ])
-    return tff.learning.from_keras_model(
-        model=model,
+    return tff.learning.models.from_keras_model(
+        keras_model=model,
         input_spec=(tf.TensorSpec(shape=[None, 24], dtype=tf.float32), tf.TensorSpec(shape=[None], dtype=tf.float32)),
         loss=tf.keras.losses.MeanSquaredError(),
         metrics=[tf.keras.metrics.MeanSquaredError()])
@@ -130,6 +142,39 @@ winner = population.run(lambda genomes, config: evaluate_with_demos(genomes, con
 with open(best_genome_path, 'wb') as f:
     pickle.dump(winner, f)
 
+# Load simulation data
+source, _ = tff.simulation.datasets.emnist.load_data()
+
+def client_data(n):
+    return source.create_tf_dataset_for_client(source.client_ids[n]).map(
+        lambda e: (tf.reshape(e['pixels'], [-1]), e['label'])
+    ).repeat(10).batch(20)
+
+# Pick a subset of client devices to participate in training
+train_data = [client_data(n) for n in range(3)]
+
+# Wrap a Keras model for use with TFF
+keras_model = tf.keras.models.Sequential([
+    tf.keras.layers.Dense(
+        10, tf.nn.softmax, input_shape=(784,), kernel_initializer='zeros')
+])
+tff_model = tff.learning.models.FunctionalModel(
+    keras_model,
+    loss_fn=tf.keras.losses.SparseCategoricalCrossentropy(),
+    input_spec=train_data[0].element_spec,
+    metrics=[tf.keras.metrics.SparseCategoricalAccuracy()])
+
+# Simulate a few rounds of training with the selected client devices
+trainer = tff.learning.algorithms.build_weighted_fed_avg(
+    tff_model,
+    client_optimizer_fn=lambda: tf.keras.optimizers.legacy.SGD(learning_rate=0.1))
+state = trainer.initialize()
+for _ in range(5):
+    result = trainer.next(state, train_data)
+    state = result.state
+    metrics = result.metrics
+    print(metrics['client_work']['train']['accuracy'])
+
 # Testing and Benchmarking Class
 class FederatedLearningTest:
     def __init__(self, clients, model_fn, trainer, state, config, demonstrations):
@@ -144,9 +189,10 @@ class FederatedLearningTest:
         metrics_list = []
         for round_num in range(rounds):
             client_data = [collect_client_data(client[0], client[1]) for client in self.clients]
-            self.state, metrics = self.trainer.next(self.state, client_data)
-            metrics_list.append(metrics)
-            print(f'Round {round_num} metrics:', metrics)
+            result = self.trainer.next(self.state, client_data)
+            self.state = result.state
+            metrics_list.append(result.metrics)
+            print(f'Round {round_num} metrics:', result.metrics)
         return metrics_list
 
     def evaluate_model(self, env, network, episodes=10):
@@ -199,7 +245,9 @@ class FederatedLearningTest:
 clients = [create_environment_and_network(i, 1.0 + 0.1 * i, config) for i in range(5)]
 
 # Federated Learning Trainer Setup
-trainer = tff.learning.build_federated_averaging_process(model_fn)
+trainer = tff.learning.algorithms.build_weighted_fed_avg(
+    model_fn,
+    client_optimizer_fn=lambda: tf.keras.optimizers.legacy.SGD(learning_rate=0.1))
 state = trainer.initialize()
 
 # Testing and benchmarking
