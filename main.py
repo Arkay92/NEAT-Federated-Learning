@@ -39,7 +39,7 @@ def create_neat_config(path):
    [NEAT]
 fitness_criterion = max
 fitness_threshold = 300
-pop_size = 150
+pop_size = 100  # Adjusted population size for faster iterations
 reset_on_extinction = False
 
 [DefaultGenome]
@@ -49,7 +49,7 @@ num_outputs = 4
 initial_connection = full
 
 activation_default = tanh
-activation_mutate_rate = 0.1
+activation_mutate_rate = 0.05  # Adjusted for quicker evolution
 activation_options = tanh relu sigmoid
 
 aggregation_default = sum
@@ -61,7 +61,7 @@ bias_init_stdev = 1.0
 bias_max_value = 30.0
 bias_min_value = -30.0
 bias_mutate_power = 0.5
-bias_mutate_rate = 0.7
+bias_mutate_rate = 0.6  # Adjusted for quicker evolution
 bias_replace_rate = 0.1
 
 response_init_mean = 1.0
@@ -76,7 +76,7 @@ compatibility_disjoint_coefficient = 1.0
 compatibility_weight_coefficient = 0.5
 
 conn_add_prob = 0.5
-conn_delete_prob = 0.5
+conn_delete_prob = 0.3  # Adjusted for quicker network adaptation
 
 enabled_default = True
 enabled_mutate_rate = 0.01
@@ -91,7 +91,7 @@ weight_init_stdev = 1.0
 weight_max_value = 30
 weight_min_value = -30
 weight_mutate_power = 0.5
-weight_mutate_rate = 0.8
+weight_mutate_rate = 0.7  # Adjusted for quicker weight adaptation
 weight_replace_rate = 0.1
 
 [DefaultSpeciesSet]
@@ -115,7 +115,7 @@ replacement_rate = 0.2
 config_path = './neat_config.txt'
 if not os.path.exists(config_path):
     print(f"Configuration file '{config_path}' not found. Creating default configuration file.")
-create_neat_config(config_path)
+    create_neat_config(config_path)
 
 try:
     config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
@@ -125,23 +125,34 @@ except Exception as e:
     print(f"An error occurred while loading the NEAT configuration: {e}")
     raise
 
-def evaluate_genomes(genomes, config):
+def evaluate_genome(genome_id, genome, config):
     env = gym.make('BipedalWalker-v3')
-    for genome_id, genome in genomes:
-        net = neat.nn.FeedForwardNetwork.create(genome, config)
-        fitness = 0
-        try:
-            for _ in range(5):  # Average performance over multiple episodes
-                state = env.reset()
-                done = False
-                while not done:
-                    action = np.clip(net.activate(state), -1, 1)
-                    state, reward, done, _ = env.step(action)
-                    fitness += reward
-        except Exception as e:
-            logger.error(f"Error evaluating genome {genome_id}: {e}")
-        genome.fitness = fitness / 5
-        logger.info(f"Genome {genome_id} fitness: {genome.fitness}")
+    net = neat.nn.FeedForwardNetwork.create(genome, config)
+    fitness = 0
+    try:
+        for _ in range(5):  # Average performance over multiple episodes
+            state = env.reset()
+            done = False
+            while not done:
+                action = np.clip(net.activate(state), -1, 1)
+                state, reward, done, _ = env.step(action)
+                fitness += reward
+    except Exception as e:
+        logger.error(f"Error evaluating genome {genome_id}: {e}")
+    finally:
+        env.close()
+    return genome_id, fitness / 5
+
+def parallel_evaluate_genomes(genomes, config):
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = {executor.submit(evaluate_genome, genome_id, genome, config): (genome_id, genome) for genome_id, genome in genomes}
+        for future in concurrent.futures.as_completed(futures):
+            genome_id, genome = futures[future]
+            try:
+                genome.fitness = future.result()[1]
+                logger.info(f"Genome {genome_id} fitness: {genome.fitness}")
+            except Exception as e:
+                logger.error(f"Genome {genome_id} evaluation generated an exception: {e}")
 
 best_genome_path = 'best_genome.pkl'
 population = neat.Population(config)
@@ -150,7 +161,7 @@ stats = neat.StatisticsReporter()
 population.add_reporter(stats)
 
 if not os.path.exists(best_genome_path):
-    winner = population.run(lambda genomes, config: evaluate_genomes(genomes, config))
+    winner = population.run(lambda genomes, config: parallel_evaluate_genomes(genomes, config))
     with open(best_genome_path, 'wb') as f:
         pickle.dump(winner, f)
 
@@ -197,6 +208,7 @@ if not os.path.exists(demo_file):
             state = next_state
     with open(demo_file, 'wb') as f:
         pickle.dump(demos, f)
+    env_demo.close()  # Close the environment after use
 
 demonstrations = pickle.load(open(demo_file, 'rb'))
 
@@ -228,7 +240,6 @@ with open(best_genome_path, 'wb') as f:
 source, _ = tff.simulation.datasets.emnist.load_data()
 
 def client_data(n):
-    source, _ = tff.simulation.datasets.emnist.load_data()
     return source.create_tf_dataset_for_client(source.client_ids[n]).map(
         lambda e: (tf.reshape(e['pixels'], [-1]), e['label'])
     ).repeat(10).batch(20)
@@ -265,6 +276,75 @@ def federated_train(num_clients, num_rounds):
         logger.info(f'Round {round_num + 1}: {metrics["client_work"]["train"]["accuracy"]}')
 
     return state, metrics
+
+# Comparing Federated NEAT and Centralized NEAT
+def compare_federated_and_centralized(federated_rewards, centralized_reward):
+    labels = ['Federated NEAT', 'Centralized NEAT']
+    avg_federated_reward = np.mean(federated_rewards)
+    rewards = [avg_federated_reward, centralized_reward]
+    
+    plt.figure(figsize=(10, 5))
+    plt.bar(labels, rewards, color=['blue', 'orange'])
+    plt.ylabel('Average Reward')
+    plt.title('Federated NEAT vs Centralized NEAT')
+    plt.show()
+    
+    logger.info(f'Federated NEAT average reward: {avg_federated_reward}')
+    logger.info(f'Centralized NEAT average reward: {centralized_reward}')
+
+# Evaluate Centralized NEAT Model
+def evaluate_centralized_model(env, genome, config, episodes=10):
+    net = neat.nn.FeedForwardNetwork.create(genome, config)
+    total_reward = 0
+    for _ in range(episodes):
+        state = env.reset()
+        done = False
+        while not done:
+            action = np.clip(net.activate(state), -1, 1)
+            state, reward, done, _ = env.step(action)
+            total_reward += reward
+    return total_reward / episodes
+
+# Centralized NEAT Setup and Training
+def centralized_neat_training(config, generations=30):
+    # Initialize the NEAT population
+    population = neat.Population(config)
+    population.add_reporter(neat.StdOutReporter(True))
+    stats = neat.StatisticsReporter()
+    population.add_reporter(stats)
+    
+    # Evaluate genomes using centralized approach
+    def evaluate_genomes_centralized(genomes, config):
+        env = gym.make('BipedalWalker-v3')
+        for genome_id, genome in genomes:
+            net = neat.nn.FeedForwardNetwork.create(genome, config)
+            fitness = 0
+            for _ in range(5):
+                state = env.reset()
+                done = False
+                while not done:
+                    action = np.clip(net.activate(state), -1, 1)
+                    state, reward, done, _ = env.step(action)
+                    fitness += reward
+            genome.fitness = fitness / 5
+            logger.info(f"Genome {genome_id} fitness: {genome.fitness}")
+        env.close()  # Ensure the environment is closed after use
+    
+    # Train the NEAT model
+    winner = population.run(lambda genomes, config: evaluate_genomes_centralized(genomes, config), generations)
+    
+    # Save the best genome
+    with open('centralized_best_genome.pkl', 'wb') as f:
+        pickle.dump(winner, f)
+    
+    return winner, stats
+    
+# Running Centralized NEAT Training
+centralized_winner, centralized_stats = centralized_neat_training(config)
+
+# Evaluate the centralized NEAT model
+centralized_reward = evaluate_centralized_model(gym.make('BipedalWalker-v3'), centralized_winner, config)
+logger.info(f'Centralized NEAT average reward: {centralized_reward}')
 
 class FederatedLearningTest:
     def __init__(self, clients, model_fn, trainer, state, config, demonstrations):
@@ -334,7 +414,7 @@ class FederatedLearningTest:
 clients = [create_environment_and_network(i, 1.0 + 0.1 * i, config) for i in range(5)]
 trainer = tff.learning.algorithms.build_weighted_fed_avg(
     model_fn,
-    client_optimizer_fn=lambda: tf.keras.optimizers.legacy.SGD(learning_rate=0.1))
+    client_optimizer_fn=lambda: tf.keras.optimizers.SGD(learning_rate=0.1))
 state = trainer.initialize()
 
 test = FederatedLearningTest(clients, model_fn, trainer, state, config, demonstrations)
@@ -349,3 +429,6 @@ test.plot_rewards(rewards)
 
 baseline_reward = 100  # Replace with actual baseline reward for comparison
 test.benchmark(baseline_reward)
+
+# Compare Federated NEAT and Centralized NEAT
+compare_federated_and_centralized(rewards, centralized_reward)
