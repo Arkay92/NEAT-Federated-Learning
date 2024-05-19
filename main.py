@@ -1,10 +1,3 @@
-# !apt-get update
-# !apt-get install python3-dev python3-pip python3-setuptools gcc libffi-dev libssl-dev
-
-# !pip install tensorflow tensorflow-federated gym numpy matplotlib swig box2d-py gym[box2d] neat --no-cache-dir
-# !pip install --upgrade tensorflow_probability tensorflow_model_optimization tensorflow-estimator==2.3.0
-# !pip install --upgrade tensorflow tensorflow-federated
-
 import warnings
 import neat
 import gym
@@ -188,44 +181,29 @@ except Exception as e:
     exit(1)
 
 # Evaluate genomes function with reinforcement learning from demonstrations (RLfD), Parallel processing of genomes evaluation
-def evaluate_genome(genome, config, env):
+def evaluate_genome(genome_id, genome, config):
+    env = gym.make('BipedalWalker-v3')
+    env._max_episode_steps = 1000
     net = neat.nn.FeedForwardNetwork.create(genome, config)
     fitness = 0
-    for _ in range(3):
-        state = env.reset()
-        done = False
-        while not done:
-            action = np.clip(net.activate(state), -1, 1)
-            state, reward, done, _ = env.step(action)
-            fitness += reward
+    try:
+        for _ in range(3):  # Average performance over multiple episodes
+            state = env.reset()
+            done = False
+            while not done:
+                action = np.clip(net.activate(state), -1, 1)
+                state, reward, done, _ = env.step(action)
+                fitness += reward
+    except Exception as e:
+        logger.error(f"Error evaluating genome {genome_id}: {e}")
     return fitness / 3, genome
 
-def evaluate_genomes(genomes, config, env):
+def evaluate_genomes(genomes, config):
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(evaluate_genome, genome, config, env) for _, genome in genomes]
+        futures = [executor.submit(evaluate_genome, genome_id, genome, config) for genome_id, genome in genomes]
         for future in concurrent.futures.as_completed(futures):
             fitness, genome = future.result()
             genome.fitness = fitness
-
-# NEAT training and saving the best genome if not already saved
-def evaluate_genomes(genomes, config):
-    env = gym.make('BipedalWalker-v3')
-    env._max_episode_steps = 1000
-    for genome_id, genome in genomes:
-        net = neat.nn.FeedForwardNetwork.create(genome, config)
-        fitness = 0
-        try:
-            for _ in range(3):  # Average performance over multiple episodes
-                state = env.reset()
-                done = False
-                while not done:
-                    action = np.clip(net.activate(state), -1, 1)
-                    state, reward, done, _ = env.step(action)
-                    fitness += reward
-        except Exception as e:
-            logger.error(f"Error evaluating genome {genome_id}: {e}")
-        genome.fitness = fitness / 3
-        logger.info(f"Genome {genome_id} fitness: {genome.fitness}")
 
 # TensorFlow Federated model function using the NEAT genome
 def model_fn():
@@ -326,7 +304,7 @@ def train_neat_non_federated(config, episodes=100):
     population.add_reporter(neat.StdOutReporter(True))
     stats = neat.StatisticsReporter()
     population.add_reporter(stats)
-    winner = population.run(lambda genomes, config: evaluate_genomes(genomes, config, env), episodes)
+    winner = population.run(lambda genomes, config: evaluate_genomes(genomes, config), episodes)
     return winner, stats
 
 # Plotting function for comparing federated and non-federated results
