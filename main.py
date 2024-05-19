@@ -15,13 +15,11 @@ import concurrent.futures
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 # Define a custom Keras layer for NEAT network
 class NEATLayer(tf.keras.layers.Layer):
     def __init__(self, neat_network, **kwargs):
         super(NEATLayer, self).__init__(**kwargs)
         self.neat_network = neat_network
-
     def call(self, inputs):
         outputs = tf.vectorized_map(lambda x: tf.convert_to_tensor(self.neat_network.activate(x.numpy().tolist())), inputs)
         return outputs
@@ -39,31 +37,26 @@ def create_neat_config(path):
    [NEAT]
 fitness_criterion = max
 fitness_threshold = 300
-pop_size = 100  # Adjusted population size for faster iterations
+pop_size = 150
 reset_on_extinction = False
-
 [DefaultGenome]
 num_hidden = 0
 num_inputs = 24
 num_outputs = 4
 initial_connection = full
-
 activation_default = tanh
-activation_mutate_rate = 0.05  # Adjusted for quicker evolution
+activation_mutate_rate = 0.1
 activation_options = tanh relu sigmoid
-
 aggregation_default = sum
 aggregation_mutate_rate = 0.0
 aggregation_options = sum
-
 bias_init_mean = 0.0
 bias_init_stdev = 1.0
 bias_max_value = 30.0
 bias_min_value = -30.0
 bias_mutate_power = 0.5
-bias_mutate_rate = 0.6  # Adjusted for quicker evolution
+bias_mutate_rate = 0.7
 bias_replace_rate = 0.1
-
 response_init_mean = 1.0
 response_init_stdev = 0.0
 response_max_value = 30.0
@@ -71,41 +64,31 @@ response_min_value = -30.0
 response_mutate_power = 0.0
 response_mutate_rate = 0.0
 response_replace_rate = 0.0
-
 compatibility_disjoint_coefficient = 1.0
 compatibility_weight_coefficient = 0.5
-
 conn_add_prob = 0.5
-conn_delete_prob = 0.3  # Adjusted for quicker network adaptation
-
+conn_delete_prob = 0.5
 enabled_default = True
 enabled_mutate_rate = 0.01
-
 feed_forward = True
-
 node_add_prob = 0.2
 node_delete_prob = 0.2
-
 weight_init_mean = 0.0
 weight_init_stdev = 1.0
 weight_max_value = 30
 weight_min_value = -30
 weight_mutate_power = 0.5
-weight_mutate_rate = 0.7  # Adjusted for quicker weight adaptation
+weight_mutate_rate = 0.8
 weight_replace_rate = 0.1
-
 [DefaultSpeciesSet]
 compatibility_threshold = 3.0
-
 [DefaultStagnation]
 species_fitness_func = max
 max_stagnation = 20
 species_elitism = 2
-
 [DefaultReproduction]
 elitism = 2
 survival_threshold = 0.2
-
 [SteadyState]
 replacement_rate = 0.2
     """
@@ -114,45 +97,56 @@ replacement_rate = 0.2
 
 config_path = './neat_config.txt'
 if not os.path.exists(config_path):
-    print(f"Configuration file '{config_path}' not found. Creating default configuration file.")
+    logger.info(f"Configuration file '{config_path}' not found. Creating default configuration file.")
+    create_neat_config(config_path)
+else:
+    logger.info("Configuration file exists. Overwriting with correct format.")
     create_neat_config(config_path)
 
 try:
-    config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
-                         neat.DefaultSpeciesSet, neat.DefaultStagnation,
-                         config_path)
+    config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction, neat.DefaultSpeciesSet, neat.DefaultStagnation, config_path)
 except Exception as e:
-    print(f"An error occurred while loading the NEAT configuration: {e}")
-    raise
+    logger.error(f"Failed to load NEAT configuration: {e}")
+    exit(1)
 
-def evaluate_genome(genome_id, genome, config):
-    env = gym.make('BipedalWalker-v3')
+# Evaluate genomes function with reinforcement learning from demonstrations (RLfD), Parallel processing of genomes evaluation
+def evaluate_genome(genome, config, env):
     net = neat.nn.FeedForwardNetwork.create(genome, config)
     fitness = 0
-    try:
-        for _ in range(5):  # Average performance over multiple episodes
-            state = env.reset()
-            done = False
-            while not done:
-                action = np.clip(net.activate(state), -1, 1)
-                state, reward, done, _ = env.step(action)
-                fitness += reward
-    except Exception as e:
-        logger.error(f"Error evaluating genome {genome_id}: {e}")
-    finally:
-        env.close()
-    return genome_id, fitness / 5
+    for _ in range(5):
+        state = env.reset()
+        done = False
+        while not done:
+            action = np.clip(net.activate(state), -1, 1)
+            state, reward, done, _ = env.step(action)
+            fitness += reward
+    return fitness / 5, genome
 
-def parallel_evaluate_genomes(genomes, config):
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        futures = {executor.submit(evaluate_genome, genome_id, genome, config): (genome_id, genome) for genome_id, genome in genomes}
+def evaluate_genomes(genomes, config, env):
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(evaluate_genome, genome, config, env) for _, genome in genomes]
         for future in concurrent.futures.as_completed(futures):
-            genome_id, genome = futures[future]
-            try:
-                genome.fitness = future.result()[1]
-                logger.info(f"Genome {genome_id} fitness: {genome.fitness}")
-            except Exception as e:
-                logger.error(f"Genome {genome_id} evaluation generated an exception: {e}")
+            fitness, genome = future.result()
+            genome.fitness = fitness
+
+# NEAT training and saving the best genome if not already saved
+def evaluate_genomes(genomes, config):
+    env = gym.make('BipedalWalker-v3')
+    for genome_id, genome in genomes:
+        net = neat.nn.FeedForwardNetwork.create(genome, config)
+        fitness = 0
+        try:
+            for _ in range(5):  # Average performance over multiple episodes
+                state = env.reset()
+                done = False
+                while not done:
+                    action = np.clip(net.activate(state), -1, 1)
+                    state, reward, done, _ = env.step(action)
+                    fitness += reward
+        except Exception as e:
+            logger.error(f"Error evaluating genome {genome_id}: {e}")
+        genome.fitness = fitness / 5
+        logger.info(f"Genome {genome_id} fitness: {genome.fitness}")
 
 best_genome_path = 'best_genome.pkl'
 population = neat.Population(config)
@@ -161,10 +155,11 @@ stats = neat.StatisticsReporter()
 population.add_reporter(stats)
 
 if not os.path.exists(best_genome_path):
-    winner = population.run(lambda genomes, config: parallel_evaluate_genomes(genomes, config))
+    winner = population.run(lambda genomes, config: evaluate_genomes(genomes, config))
     with open(best_genome_path, 'wb') as f:
         pickle.dump(winner, f)
 
+# TensorFlow Federated model function using the NEAT genome
 def model_fn():
     genome = load_genome('best_genome.pkl')
     config_path = './neat_config.txt'
@@ -180,6 +175,7 @@ def model_fn():
         loss=tf.keras.losses.MeanSquaredError(),
         metrics=[tf.keras.metrics.MeanSquaredError()])
 
+# Collect client data for federated learning using Gym environments
 def collect_client_data(environment, net, episodes=10):
     data = []
     for _ in range(episodes):
@@ -194,6 +190,7 @@ def collect_client_data(environment, net, episodes=10):
     dataset = tf.data.Dataset.from_tensor_slices((np.array(states), np.array(actions)))
     return dataset.batch(32)
 
+# Create demonstrations for reinforcement learning, saved as pickle
 demo_file = 'demonstrations.pkl'
 if not os.path.exists(demo_file):
     env_demo = gym.make('BipedalWalker-v3')
@@ -208,10 +205,7 @@ if not os.path.exists(demo_file):
             state = next_state
     with open(demo_file, 'wb') as f:
         pickle.dump(demos, f)
-    env_demo.close()  # Close the environment after use
-
 demonstrations = pickle.load(open(demo_file, 'rb'))
-
 def load_genome(filepath):
     try:
         with open(filepath, 'rb') as f:
@@ -220,6 +214,7 @@ def load_genome(filepath):
         logger.error(f"Error: File '{filepath}' not found. Exiting.")
         raise SystemExit
 
+# Evaluate genomes with RLfD using demonstrations
 def evaluate_with_demos(genomes, config, env, demonstrations):
     for genome_id, genome in genomes:
         net = neat.nn.FeedForwardNetwork.create(genome, config)
@@ -233,24 +228,29 @@ def evaluate_with_demos(genomes, config, env, demonstrations):
                 fitness += reward
         genome.fitness = fitness / 5
 
+# NEAT training incorporating demonstrations
 winner = population.run(lambda genomes, config: evaluate_with_demos(genomes, config, create_environment_and_network(1, 1.0, config)[0], demonstrations), 30)
 with open(best_genome_path, 'wb') as f:
     pickle.dump(winner, f)
 
+# Load simulation data for federated learning
 source, _ = tff.simulation.datasets.emnist.load_data()
 
 def client_data(n):
+    source, _ = tff.simulation.datasets.emnist.load_data()
     return source.create_tf_dataset_for_client(source.client_ids[n]).map(
         lambda e: (tf.reshape(e['pixels'], [-1]), e['label'])
     ).repeat(10).batch(20)
 
+# Pick a subset of client devices to participate in training
 train_data = [client_data(n) for n in range(3)]
 
+# Wrap a Keras model for use with TensorFlow Federated
+# Federated Learning Execution
 tff_model = model_fn()
 trainer = tff.learning.algorithms.build_weighted_fed_avg(
     tff_model,
     client_optimizer_fn=lambda: tf.keras.optimizers.SGD(learning_rate=0.1))
-
 state = trainer.initialize()
 
 for _ in range(5):
@@ -262,13 +262,11 @@ for _ in range(5):
 def federated_train(num_clients, num_rounds):
     clients = [create_environment_and_network(i, 1.0 + 0.1 * i, config) for i in range(num_clients)]
     train_data = [client_data(n) for n in range(num_clients)]
-
     model = model_fn()
     trainer = tff.learning.algorithms.build_weighted_fed_avg(
         model,
         client_optimizer_fn=lambda: tf.keras.optimizers.SGD(learning_rate=0.1))
     state = trainer.initialize()
-
     for round_num in range(num_rounds):
         result = trainer.next(state, train_data)
         state = result.state
@@ -276,76 +274,30 @@ def federated_train(num_clients, num_rounds):
         logger.info(f'Round {round_num + 1}: {metrics["client_work"]["train"]["accuracy"]}')
 
     return state, metrics
-
-# Comparing Federated NEAT and Centralized NEAT
-def compare_federated_and_centralized(federated_rewards, centralized_reward):
-    labels = ['Federated NEAT', 'Centralized NEAT']
-    avg_federated_reward = np.mean(federated_rewards)
-    rewards = [avg_federated_reward, centralized_reward]
-    
-    plt.figure(figsize=(10, 5))
-    plt.bar(labels, rewards, color=['blue', 'orange'])
-    plt.ylabel('Average Reward')
-    plt.title('Federated NEAT vs Centralized NEAT')
-    plt.show()
-    
-    logger.info(f'Federated NEAT average reward: {avg_federated_reward}')
-    logger.info(f'Centralized NEAT average reward: {centralized_reward}')
-
-# Evaluate Centralized NEAT Model
-def evaluate_centralized_model(env, genome, config, episodes=10):
-    net = neat.nn.FeedForwardNetwork.create(genome, config)
-    total_reward = 0
-    for _ in range(episodes):
-        state = env.reset()
-        done = False
-        while not done:
-            action = np.clip(net.activate(state), -1, 1)
-            state, reward, done, _ = env.step(action)
-            total_reward += reward
-    return total_reward / episodes
-
-# Centralized NEAT Setup and Training
-def centralized_neat_training(config, generations=30):
-    # Initialize the NEAT population
+  
+# NEAT training function for non-federated learning
+def train_neat_non_federated(config, episodes=100):
+    env = gym.make('BipedalWalker-v3')
     population = neat.Population(config)
     population.add_reporter(neat.StdOutReporter(True))
     stats = neat.StatisticsReporter()
     population.add_reporter(stats)
-    
-    # Evaluate genomes using centralized approach
-    def evaluate_genomes_centralized(genomes, config):
-        env = gym.make('BipedalWalker-v3')
-        for genome_id, genome in genomes:
-            net = neat.nn.FeedForwardNetwork.create(genome, config)
-            fitness = 0
-            for _ in range(5):
-                state = env.reset()
-                done = False
-                while not done:
-                    action = np.clip(net.activate(state), -1, 1)
-                    state, reward, done, _ = env.step(action)
-                    fitness += reward
-            genome.fitness = fitness / 5
-            logger.info(f"Genome {genome_id} fitness: {genome.fitness}")
-        env.close()  # Ensure the environment is closed after use
-    
-    # Train the NEAT model
-    winner = population.run(lambda genomes, config: evaluate_genomes_centralized(genomes, config), generations)
-    
-    # Save the best genome
-    with open('centralized_best_genome.pkl', 'wb') as f:
-        pickle.dump(winner, f)
-    
+    winner = population.run(lambda genomes, config: evaluate_genomes(genomes, config, env), episodes)
     return winner, stats
-    
-# Running Centralized NEAT Training
-centralized_winner, centralized_stats = centralized_neat_training(config)
 
-# Evaluate the centralized NEAT model
-centralized_reward = evaluate_centralized_model(gym.make('BipedalWalker-v3'), centralized_winner, config)
-logger.info(f'Centralized NEAT average reward: {centralized_reward}')
+# Plotting function for comparing federated and non-federated results
+def plot_comparison(federated_rewards, non_federated_rewards):
+    plt.figure(figsize=(10, 5))
+    episodes = range(len(federated_rewards))
+    plt.plot(episodes, federated_rewards, label='Federated NEAT')
+    plt.plot(episodes, non_federated_rewards, label='Non-Federated NEAT')
+    plt.xlabel('Episodes')
+    plt.ylabel('Rewards')
+    plt.title('Comparison of Federated and Non-Federated NEAT')
+    plt.legend()
+    plt.show()
 
+# Federated Learning Testing and Benchmarking Class
 class FederatedLearningTest:
     def __init__(self, clients, model_fn, trainer, state, config, demonstrations):
         self.clients = clients
@@ -354,7 +306,6 @@ class FederatedLearningTest:
         self.state = state
         self.config = config
         self.demonstrations = demonstrations
-
     def run_federated_training(self, rounds=10):
         metrics_list = []
         for round_num in range(rounds):
@@ -364,7 +315,6 @@ class FederatedLearningTest:
             metrics_list.append(result.metrics)
             logger.info(f'Round {round_num} metrics: {result.metrics}')
         return metrics_list
-
     def evaluate_model(self, env, network, episodes=10):
         total_reward = 0
         for _ in range(episodes):
@@ -375,11 +325,9 @@ class FederatedLearningTest:
                 state, reward, done, _ = env.step(action)
                 total_reward += reward
         return total_reward / episodes
-
     def plot_metrics(self, metrics_list):
         rounds = range(len(metrics_list))
         mse = [metrics['mean_squared_error'].numpy() for metrics in metrics_list]
-
         plt.figure(figsize=(10, 5))
         plt.plot(rounds, mse, label='Mean Squared Error')
         plt.xlabel('Rounds')
@@ -387,7 +335,6 @@ class FederatedLearningTest:
         plt.title('Federated Learning Training Metrics')
         plt.legend()
         plt.show()
-
     def plot_rewards(self, rewards):
         plt.figure(figsize=(10, 5))
         plt.plot(range(len(rewards)), rewards, label='Rewards')
@@ -396,7 +343,6 @@ class FederatedLearningTest:
         plt.title('Model Rewards Over Episodes')
         plt.legend()
         plt.show()
-
     def benchmark(self, baseline_reward):
         neat_network = neat.nn.FeedForwardNetwork.create(pickle.load(open(best_genome_path, 'rb')), self.config)
         client_rewards = [self.evaluate_model(client[0], neat_network) for client in self.clients]
@@ -404,6 +350,7 @@ class FederatedLearningTest:
 
         logger.info(f'Average reward after federated learning: {avg_reward}')
         logger.info(f'Baseline reward: {baseline_reward}')
+        
 
         plt.figure(figsize=(10, 5))
         plt.bar(['Baseline', 'Federated Learning'], [baseline_reward, avg_reward])
@@ -411,24 +358,31 @@ class FederatedLearningTest:
         plt.title('Benchmarking')
         plt.show()
 
+# Initialize environments and networks for clients
 clients = [create_environment_and_network(i, 1.0 + 0.1 * i, config) for i in range(5)]
+
+# Federated Learning Trainer Setup
 trainer = tff.learning.algorithms.build_weighted_fed_avg(
     model_fn,
-    client_optimizer_fn=lambda: tf.keras.optimizers.SGD(learning_rate=0.1))
+    client_optimizer_fn=lambda: tf.keras.optimizers.legacy.SGD(learning_rate=0.1))
 state = trainer.initialize()
 
+# Testing and benchmarking
 test = FederatedLearningTest(clients, model_fn, trainer, state, config, demonstrations)
 
+# Run federated training
 state, final_metrics = federated_train(5, 10)
 
-test.plot_metrics(final_metrics)
+# Run non-federated training
+winner, stats = train_neat_non_federated(config, 100)
 
-neat_network = neat.nn.FeedForwardNetwork.create(pickle.load(open(best_genome_path, 'rb')), config)
-rewards = [test.evaluate_model(client[0], neat_network) for client in clients]
-test.plot_rewards(rewards)
+# Save winner genome
+with open('winner_genome.pkl', 'wb') as f:
+    pickle.dump(winner, f)
 
-baseline_reward = 100  # Replace with actual baseline reward for comparison
-test.benchmark(baseline_reward)
+# Evaluate rewards for both methods
+federated_rewards = [test.evaluate_model(client[0], neat_network) for client in clients]
+non_federated_rewards = [test.evaluate_model(client[0], neat_network, 100) for client in [winner]] * len(clients)
 
-# Compare Federated NEAT and Centralized NEAT
-compare_federated_and_centralized(rewards, centralized_reward)
+# Plot the comparison of federated vs non-federated training
+plot_comparison(federated_rewards, non_federated_rewards)
