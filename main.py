@@ -274,7 +274,7 @@ def federated_train(num_clients, num_rounds):
         logger.info(f'Round {round_num + 1}: {metrics["client_work"]["train"]["accuracy"]}')
 
     return state, metrics
-  
+
 # NEAT training function for non-federated learning
 def train_neat_non_federated(config, episodes=100):
     env = gym.make('BipedalWalker-v3')
@@ -350,7 +350,7 @@ class FederatedLearningTest:
 
         logger.info(f'Average reward after federated learning: {avg_reward}')
         logger.info(f'Baseline reward: {baseline_reward}')
-        
+
 
         plt.figure(figsize=(10, 5))
         plt.bar(['Baseline', 'Federated Learning'], [baseline_reward, avg_reward])
