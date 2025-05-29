@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import logging
 import concurrent.futures
 import cProfile
+from sklearn.metrics import mean_squared_error
+from tensorflow_addons.layers import GroupNormalization
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -21,26 +23,58 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 CONFIG_PATH = './neat_config.txt'
 BEST_GENOME_PATH = './best_genome.pkl'
 DEMO_FILE = './demonstrations.pkl'
-NUM_CLIENTS = 5
-MAX_GEN = 3 
-NUM_ROUNDS = 10
-EPISODES_PER_EVALUATION = 15
+NUM_CLIENTS = 10
+MAX_GEN = 5
+NUM_ROUNDS = 5
+EPISODES_PER_EVALUATION = 25
 MAX_EPISODES = 500
 NUM_INPUTS = 24
 NUM_OUTPUTS = 4
+CHECKPOINT_DIR = './checkpoints'
 
-class NEATLayer(tf.keras.layers.Layer):
-    def __init__(self, neat_network, **kwargs):
-        super(NEATLayer, self).__init__(**kwargs)
-        self.neat_network = neat_network
+# Ensure checkpoint directory exists
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+def precompute_neat_outputs(env, network, num_samples):
+    inputs = []
+    outputs = []
+    for _ in range(num_samples):
+        state = env.reset()
+        done = False
+        while not done:
+            action = np.clip(network.activate(state), -1, 1)
+            inputs.append(state)
+            outputs.append(action)
+            state, _, done, _ = env.step(action)
+    return np.array(inputs), np.array(outputs)
+
+# Modify the NEATMarkovLayer to accept precomputed outputs
+class NEATMarkovLayer(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(NEATMarkovLayer, self).__init__(**kwargs)
+        self.gp_model = self._create_gp_model()
+
+    def _create_gp_model(self):
+        # Define a simple sequential model as the internal model
+        return tf.keras.Sequential([
+            tf.keras.layers.Dense(512, activation='relu'),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.Dense(256, activation='relu'),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.Dense(128, activation='relu'),
+            tf.keras.layers.Dense(64, activation='relu'),
+            tf.keras.layers.Dense(1)  # Assuming the output is a single scalar
+        ])
 
     def call(self, inputs):
-        outputs = tf.vectorized_map(lambda x: tf.convert_to_tensor(self.neat_network.activate(x.numpy().tolist())), inputs)
-        return outputs
+        return self.gp_model(inputs)
 
     def compute_output_shape(self, input_shape):
-        return (input_shape[0], 4)  # Assuming the NEAT network outputs 4 values
+        return (input_shape[0], 1)  # Assuming the final output is a single value
 
+# Federated Learning Test
 class FederatedLearningTest:
     def __init__(self, clients, model_fn, trainer, state, config, demonstrations):
         self.clients = clients
@@ -49,17 +83,65 @@ class FederatedLearningTest:
         self.state = state
         self.config = config
         self.demonstrations = demonstrations
+        self.client_learning_rates = self.adjust_learning_rates()
 
     def run_federated_training(self, rounds=NUM_ROUNDS):
-        metrics_list = []
-        for round_num in range(rounds):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-                client_data = list(executor.map(lambda client: collect_client_data(client[0], client[1]), self.clients))
-            result = self.trainer.next(self.state, client_data)
-            self.state = result.state
-            metrics_list.append(result.metrics)
-            logger.info(f'Round {round_num + 1} metrics: {result.metrics}')
-        return metrics_list
+      metrics_list = []
+      for round_num in range(rounds):
+          self.client_learning_rates = self.adjust_learning_rates()  # Adjust learning rates each round
+          with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+              client_data = list(executor.map(lambda client: list(collect_client_data(client[0], client[1], self.client_learning_rates[client[2]])), self.clients))
+          weights = [self.evaluate_model(client[0], client[1]) for client in self.clients]
+          total_weight = sum(weights)
+          self.normalized_weights = [weight / total_weight for weight in weights]
+          aggregated_data = self.weighted_aggregation(client_data)
+          result = self.trainer.next(self.state, aggregated_data)
+          self.state = result.state
+          metrics_list.append(result.metrics)
+          logger.info(f'Round {round_num + 1} metrics: {result.metrics}')
+          self.save_checkpoint(round_num)
+          if self.early_stopping(metrics_list):
+              logger.info(f'Early stopping at round {round_num + 1}')
+              break
+      return self.state, metrics_list
+
+    def adjust_learning_rates(self):
+        client_learning_rates = {}
+        for i, client in enumerate(self.clients):
+            performance = self.evaluate_model(client[0], client[1])
+            learning_rate = 0.1 / (1 + np.exp(-performance))  # Example adjustment based on performance
+            client_learning_rates[i] = learning_rate
+            logger.info(f'Client {i} learning rate adjusted to {learning_rate}')
+        return client_learning_rates
+
+    def early_stopping(self, metrics_list, threshold=0.01, patience=3):
+        if len(metrics_list) < patience:
+            return False
+        recent_mse = [metrics['client_work']['train']['mean_squared_error'] for metrics in metrics_list[-patience:]]
+        return np.mean(recent_mse) < threshold
+
+    def weighted_aggregation(self, client_data):
+      def aggregate_batches(batch_list, weights):
+          max_size = max(batch['x'].shape[0] for batch in batch_list)
+          agg_x = np.zeros((max_size, batch_list[0]['x'].shape[1]), dtype=np.float32)
+          agg_y = np.zeros((max_size, batch_list[0]['y'].shape[1]), dtype=np.float32)
+
+          for batch, weight in zip(batch_list, weights):
+              x_padded = np.pad(batch['x'].numpy(), ((0, max_size - batch['x'].shape[0]), (0, 0)), 'constant')
+              y_padded = np.pad(batch['y'].numpy(), ((0, max_size - batch['y'].shape[0]), (0, 0)), 'constant')
+              agg_x += x_padded * weight
+              agg_y += y_padded * weight
+
+          return {'x': agg_x, 'y': agg_y}
+
+      all_batches = list(zip(*[list(client_data[i]) for i in range(len(client_data))]))
+      aggregated_data = []
+      for batch_group in all_batches:
+          batch_dicts = [batch for batch in batch_group]
+          aggregated_batch = aggregate_batches(batch_dicts, self.normalized_weights)
+          aggregated_data.append(tf.data.Dataset.from_tensor_slices(aggregated_batch).batch(32))
+
+      return aggregated_data
 
     def evaluate_model(self, env, network, episodes=MAX_GEN):
         total_reward = 0
@@ -116,6 +198,32 @@ class FederatedLearningTest:
         plt.legend()
         plt.show()
 
+    def save_checkpoint(self, round_num):
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_round_{round_num}.pkl')
+        with open(checkpoint_path, 'wb') as f:
+            pickle.dump((self.state, self.client_learning_rates), f)
+        logger.info(f'Checkpoint saved at round {round_num} to {checkpoint_path}')
+
+    def load_checkpoint(self, round_num):
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_round_{round_num}.pkl')
+        if os.path.exists(checkpoint_path):
+            with open(checkpoint_path, 'rb') as f:
+                self.state, self.client_learning_rates = pickle.load(f)
+            logger.info(f'Checkpoint loaded from round {round_num} from {checkpoint_path}')
+        else:
+            logger.error(f'Checkpoint file {checkpoint_path} does not exist')
+
+# Generate synthetic data with augmentation
+def generate_synthetic_data(num_samples, augment=False):
+    X = np.linspace(0, 10, num_samples).astype(np.float32).reshape(-1, 1)
+    y = (np.sin(X).ravel() + np.random.normal(0, 0.1, num_samples)).astype(np.float32).reshape(-1, 1)
+    if augment:
+        X_aug = X + np.random.normal(0, 0.1, X.shape).astype(np.float32)
+        y_aug = y + np.random.normal(0, 0.1, y.shape).astype(np.float32)
+        X = np.vstack((X, X_aug))
+        y = np.vstack((y, y_aug))
+    return X, y
+
 # Helper function to create environments and networks for each client
 def create_environment_and_network(client_id, variation, config):
     env = gym.make('BipedalWalker-v3')
@@ -123,7 +231,7 @@ def create_environment_and_network(client_id, variation, config):
     env.env.gravity = variation * client_id
     genome = load_genome(BEST_GENOME_PATH)
     network = neat.nn.FeedForwardNetwork.create(genome, config)
-    return env, network
+    return env, network, client_id
 
 def create_neat_config(path):
     config_content = """
@@ -170,7 +278,7 @@ def create_neat_config(path):
     weight_init_stdev = 1.0
     weight_max_value = 30
     weight_min_value = -30
-    weight_mutate_power = 0.5
+    weight_mutate_power = 1.0
     weight_mutate_rate = 0.8
     weight_replace_rate = 0.1
     [DefaultSpeciesSet]
@@ -232,39 +340,44 @@ def evaluate_genomes(genomes, config):
                 logger.error(f"Error evaluating genome {genome_id}: {e}")
 
 def model_fn():
-    genome = load_genome(BEST_GENOME_PATH)
-    neat_network = neat.nn.FeedForwardNetwork.create(genome, config)
-    hidden_weights, output_weights, hidden_biases, output_biases = extract_neat_weights(neat_network, NUM_INPUTS, NUM_OUTPUTS)
-    model = create_tf_model_from_neat(NUM_INPUTS, NUM_OUTPUTS, hidden_weights, output_weights, hidden_biases, output_biases)
+    neat_input = tf.keras.Input(shape=(NUM_OUTPUTS,), name='x')  # Ensure this matches the reshaped data
+    markov_output = NEATMarkovLayer()(neat_input)
+    final_output = tf.keras.layers.Dense(1, activation='sigmoid')(markov_output)
 
+    model = tf.keras.Model(inputs=neat_input, outputs=final_output)
     return tff.learning.models.from_keras_model(
         keras_model=model,
-        input_spec=(
-            tf.TensorSpec(shape=[None, NUM_INPUTS], dtype=tf.float32),
-            tf.TensorSpec(shape=[None, NUM_OUTPUTS], dtype=tf.float32)
-        ),
+        input_spec={
+            'x': tf.TensorSpec(shape=[None, NUM_OUTPUTS], dtype=tf.float32),
+            'y': tf.TensorSpec(shape=[None, 1], dtype=tf.float32)
+        },
         loss=tf.keras.losses.MeanSquaredError(),
-        metrics=[tf.keras.metrics.MeanSquaredError()])
+        metrics=[tf.keras.metrics.MeanSquaredError()]
+    )
 
-def collect_client_data(environment, net, episodes=MAX_GEN):
-    data = []
-    try:
-        for _ in range(episodes):
-            state = environment.reset()
-            done = False
-            while not done:
-                action = np.clip(net.activate(state), -1, 1)
-                next_state, reward, done, _ = environment.step(action)
-                data.append((state, action))
-                state = next_state
-        states, actions = zip(*data)
-        states = np.array(states, dtype=np.float32)
-        actions = np.array(actions, dtype=np.float32)
-        dataset = tf.data.Dataset.from_tensor_slices((states, actions)).batch(32)
-        return dataset
-    except Exception as e:
-        logger.error(f"Error collecting client data: {e}")
-        return None
+def precompute_neat_outputs(env, network, num_samples):
+    states = []
+    outputs = []
+    for _ in range(num_samples):
+        state = env.reset()
+        done = False
+        while not done:
+            action = network.activate(state)  # Get action from NEAT network
+            states.append(state)
+            outputs.append(action)  # Assuming action needs to be transformed for TensorFlow compatibility
+            state, _, done, _ = env.step(action)
+    return np.array(states, dtype=np.float32), np.array(outputs, dtype=np.float32)
+
+# Adjust data collection to use precomputed NEAT outputs
+def collect_client_data(environment, net, learning_rate, episodes=EPISODES_PER_EVALUATION):
+    states, actions = precompute_neat_outputs(environment, net, episodes)
+    actions = actions.reshape(-1, NUM_OUTPUTS)  # Make sure actions shape matches NUM_OUTPUTS
+
+    dataset = tf.data.Dataset.from_tensor_slices({
+        'x': actions,
+        'y': actions[:, 0:1]  # Assuming your model predicts something based on actions
+    }).batch(32)
+    return dataset
 
 if not os.path.exists(DEMO_FILE):
     env_demo = gym.make('BipedalWalker-v3')
@@ -275,7 +388,7 @@ if not os.path.exists(DEMO_FILE):
         while not done:
             action = env_demo.action_space.sample()  # Random actions as placeholders
             next_state, _, done, _ = env_demo.step(action)
-            demos.append((state, action))
+            demos.append((state, [action]))  # Ensure action is wrapped in a list
             state = next_state
     with open(DEMO_FILE, 'wb') as f:
         pickle.dump(demos, f)
@@ -304,7 +417,7 @@ def evaluate_with_demos(genomes, config, env, demonstrations):
 
 def federated_train(num_clients=NUM_CLIENTS, num_rounds=NUM_ROUNDS):
     clients = [create_environment_and_network(i, 1.0 + 0.1 * i, config) for i in range(num_clients)]
-    train_data = [collect_client_data(client[0], client[1]) for client in clients]
+    train_data = [collect_client_data(client[0], client[1], 0.1) for client in clients if collect_client_data(client[0], client[1], 0.1) is not None]
     model = model_fn()
     trainer = tff.learning.algorithms.build_weighted_fed_avg(
         model_fn=model_fn,
@@ -318,7 +431,6 @@ def federated_train(num_clients=NUM_CLIENTS, num_rounds=NUM_ROUNDS):
         metrics = result.metrics
         metrics_list.append(metrics)
         logger.info(f'Round {round_num + 1}: {metrics["client_work"]["train"]["mean_squared_error"]}')
-
     return state, metrics_list
 
 def train_neat_non_federated(config, generations=MAX_GEN):
@@ -352,66 +464,6 @@ def plot_comparison(federated_rewards, non_federated_rewards):
     plt.legend()
     plt.show()
 
-def extract_neat_weights(neat_network, num_inputs, num_outputs):
-    # Determine the number of hidden nodes by excluding input and output nodes
-    total_nodes = len(neat_network.node_evals)
-    num_hidden = total_nodes - num_outputs - num_inputs
-
-    # Initialize weight matrices and bias vectors
-    hidden_weights = np.zeros((num_inputs, num_hidden)) if num_hidden > 0 else np.array([])
-    output_weights = np.zeros((num_hidden if num_hidden > 0 else num_inputs, num_outputs))
-    hidden_biases = np.zeros(num_hidden) if num_hidden > 0 else np.array([])
-    output_biases = np.zeros(num_outputs)
-
-    # Track hidden node indices to map correctly
-    hidden_indices = {}
-
-    # Populate the hidden_indices dictionary
-    for node in neat_network.node_evals:
-        node_index = node[0]
-        if num_inputs <= node_index < num_inputs + num_hidden:
-            hidden_indices[node_index] = node_index - num_inputs
-
-    # Fill weights and biases from connections
-    for node in neat_network.node_evals:
-        node_index, activation, aggregation, bias, response, inputs = node[:6]
-        if node_index in hidden_indices:  # It's a hidden node
-            hidden_biases[hidden_indices[node_index]] = bias
-            for input_id, weight in inputs:
-                if input_id < num_inputs:  # Connection from input to this hidden node
-                    hidden_weights[input_id, hidden_indices[node_index]] = weight
-                else:  # Connection from another hidden node
-                    if input_id in hidden_indices:
-                        hidden_weights[hidden_indices[input_id], hidden_indices[node_index]] = weight
-        elif node_index >= num_inputs + num_hidden:  # It's an output node
-            output_index = node_index - (num_inputs + num_hidden)
-            if 0 <= output_index < num_outputs:  # Ensure the index is within bounds
-                output_biases[output_index] = bias
-                for input_id, weight in inputs:
-                    if input_id in hidden_indices:  # Connection from a hidden node to this output node
-                        output_weights[hidden_indices[input_id], output_index] = weight
-                    elif input_id < num_inputs:  # Connection from an input node directly to output
-                        output_weights[input_id, output_index] = weight
-
-    return hidden_weights, output_weights, hidden_biases, output_biases
-
-def create_tf_model_from_neat(num_inputs, num_outputs, hidden_weights, output_weights, hidden_biases, output_biases):
-    inputs = tf.keras.Input(shape=(num_inputs,))
-    x = inputs
-    if hidden_weights.size > 0:
-        x = tf.keras.layers.Dense(
-            units=hidden_weights.shape[1], activation='relu', use_bias=True,
-            kernel_initializer=tf.keras.initializers.Constant(hidden_weights),
-            bias_initializer=tf.keras.initializers.Constant(hidden_biases)
-        )(x)
-    x = tf.keras.layers.Dense(
-        units=num_outputs, activation='tanh', use_bias=True,
-        kernel_initializer=tf.keras.initializers.Constant(output_weights),
-        bias_initializer=tf.keras.initializers.Constant(output_biases)
-    )(x)
-    model = tf.keras.Model(inputs=inputs, outputs=x)
-    return model
-
 if __name__ == "__main__":
     # Profile the script to find bottlenecks
     profiler = cProfile.Profile()
@@ -424,10 +476,10 @@ if __name__ == "__main__":
     population.add_reporter(neat.StdOutReporter(True))
     stats = neat.StatisticsReporter()
     population.add_reporter(stats)
-    
+
     # Evaluate the population
     genomes = list(population.population.items())
-    
+
     if not os.path.exists(BEST_GENOME_PATH):
         winner = population.run(lambda genomes, config: evaluate_genomes(genomes, config), MAX_GEN)
         with open(BEST_GENOME_PATH, 'wb') as f:
@@ -440,13 +492,13 @@ if __name__ == "__main__":
 
     clients = [create_environment_and_network(i, 1.0 + 0.1 * i, config) for i in range(NUM_CLIENTS)]
     trainer = tff.learning.algorithms.build_weighted_fed_avg(
-        model_fn,
+        model_fn=model_fn,
         client_optimizer_fn=lambda: tf.keras.optimizers.SGD(learning_rate=0.1)
     )
     state = trainer.initialize()
 
     test = FederatedLearningTest(clients, model_fn, trainer, state, config, demonstrations)
-    state, federated_metrics = federated_train(NUM_CLIENTS, NUM_ROUNDS)
+    state, federated_metrics = test.run_federated_training(NUM_ROUNDS)
 
     neat_network = neat.nn.FeedForwardNetwork.create(pickle.load(open(BEST_GENOME_PATH, 'rb')), config)
     federated_rewards = [test.evaluate_model(client[0], neat_network) for client in clients]
