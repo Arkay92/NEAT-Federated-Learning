@@ -2,6 +2,8 @@
 
 Combine NeuroEvolution of Augmenting Topologies (`NEAT`) with TensorFlow Federated (`TFF`) for decentralized reinforcement learning in OpenAI Gym environments.
 
+Repository this paper: https://www.sciencedirect.com/science/article/pii/S1877050925009986
+
 ## Features
 
 - **NEAT Evolution**  
